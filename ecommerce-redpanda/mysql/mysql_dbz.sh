@@ -15,7 +15,7 @@ curl -s -X PUT -H  "Content-Type:application/json" http://debezium:8083/connecto
     "database.history.kafka.bootstrap.servers":"'"$KAFKA_ADDR"'",
     "database.history.kafka.topic": "mysql-history",
     "database.include.list": "teeworlds",
-    "table.include.list": "teeworlds.record_race,teeworlds.record_teamrace,teeworlds.record_maps,teeworlds.record_mapinfo",
+    "table.include.list": "teeworlds.record_race,teeworlds.record_teamrace,teeworlds.record_maps,teeworlds.record_mapinfo,teeworlds.record_mappers",
     "time.precision.mode": "connect",
     "include.schema.changes": false
  }'

@@ -1,4 +1,8 @@
-ALTER SYSTEM SET enable_disk_cluster_replicas = true;
+-- As mz_system
+--ALTER SYSTEM SET enable_disk_cluster_replicas = true;
+
+DROP CLUSTER IF EXISTS disk_cluster1 CASCADE;
+DROP CLUSTER IF EXISTS disk_cluster2 CASCADE;
 CREATE CLUSTER disk_cluster1 REPLICAS (r1 (SIZE '1', DISK = true));
 CREATE CLUSTER disk_cluster2 REPLICAS (r1 (SIZE '16', DISK = true));
 
@@ -35,13 +39,21 @@ CREATE SOURCE record_mapinfo
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
   ENVELOPE NONE;
 
+CREATE SOURCE record_mappers
+  IN CLUSTER disk_cluster1
+  FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_mappers')
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
+  ENVELOPE NONE;
+
 CREATE OR REPLACE VIEW race AS SELECT (after)."Map" AS map, (after)."Server" as server, (after)."Name" as name, cast((after)."Timestamp" as timestamp) as timestamp, (after)."Time" as time FROM record_race;
 CREATE OR REPLACE VIEW teamrace AS SELECT (after)."Map" AS map, (after)."Name" as name, cast((after)."Timestamp" as timestamp) as timestamp, (after)."Time" as time, (after)."ID" as id, (after)."GameID" as gameid FROM record_teamrace;
 CREATE OR REPLACE VIEW maps AS SELECT (after)."Map" AS map, (after)."Server" as server, (after)."Points" as points, (after)."Stars" as stars, (after)."Mapper" as mapper, cast((after)."Timestamp" as timestamp) as timestamp FROM record_maps;
 CREATE INDEX maps_map IN CLUSTER disk_cluster2 ON maps (map);
 
---  record(Map: text,Width: integer?,Height: integer?,DEATH: integer?,THROUGH: integer?,JUMP: integer?,DFREEZE: integer?,EHOOK_START: integer?,HIT_END: integer?,SOLO_START: integer?,TELE_GUN: integer?,TELE_GRENADE: integer?,TELE_LASER: integer?,NPC_START: integer?,SUPER_START: integer?,JETPACK_START: integer?,WALLJUMP: integer?,NPH_START: integer?,WEAPON_SHOTGUN: integer?,WEAPON_GRENADE: integer?,POWERUP_NINJA: integer?,WEAPON_RIFLE: integer?,LASER_STOP: integer?,CRAZY_SHOTGUN: integer?,DRAGGER: integer?,DOOR: integer?,SWITCH_TIMED: integer?,SWITCH: integer?,STOP: integer?,THROUGH_ALL: integer?,TUNE: integer?,OLDLASER: integer?,TELEINEVIL: integer?,TELEIN: integer?,TELECHECK: integer?,TELEINWEAPON: integer?,TELEINHOOK: integer?,CHECKPOINT_FIRST: integer?,BONUS: integer?,BOOST: integer?,PLASMAF: integer?,PLASMAE: integer?,PLASMAU: integer?)
---CREATE VIEW mapinfo AS SELECT (after)."Map" AS map, (after)."Width" as width, (after)."Height" as height, (after)."Death" as death, (after)."Through" as through, (after)."Jump" as jump FROM record_maps;
+CREATE OR REPLACE VIEW mappers AS SELECT (after)."Mapper" AS Mapper, (after)."NumMaps" as nummaps FROM record_mappers;
+CREATE INDEX mappers_mapper IN CLUSTER disk_cluster2 ON mappers (mapper);
+CREATE VIEW mapinfo AS SELECT (after)."Map" AS map, (after)."Width" as width, (after)."Height" as height, (after)."DEATH" as death, (after)."THROUGH" as through, (after)."JUMP" as jump, (after)."DFREEZE" AS dfreeze, (after)."EHOOK_START" AS ehook_start, (after)."HIT_END" AS hit_end, (after)."SOLO_START" AS solo_start, (after)."TELE_GUN" AS tele_gun, (after)."TELE_GRENADE" AS tele_grenade, (after)."TELE_LASER" AS tele_laser, (after)."NPC_START" AS npc_start, (after)."SUPER_START" AS super_start, (after)."JETPACK_START" AS jetpack_start, (after)."WALLJUMP" AS walljump, (after)."NPH_START" AS nph_start, (after)."WEAPON_SHOTGUN" AS weapon_shotgun, (after)."WEAPON_GRENADE" AS weapon_grenade, (after)."POWERUP_NINJA" AS powerup_ninja, (after)."WEAPON_RIFLE" AS weapon_rifle, (after)."LASER_STOP" AS laser_stop, (after)."CRAZY_SHOTGUN" AS crazy_shotgun, (after)."DRAGGER" AS dragger, (after)."DOOR" AS door, (after)."SWITCH_TIMED" AS switch_timed, (after)."SWITCH" AS switch, (after)."STOP" AS stop, (after)."THROUGH_ALL" AS through_all, (after)."TUNE" AS tune, (after)."OLDLASER" AS oldlaser, (after)."TELEINEVIL" AS teleinevil, (after)."TELEIN" AS telein, (after)."TELECHECK" AS telecheck, (after)."TELEINWEAPON" AS teleinweapon, (after)."TELEINHOOK" AS teleinhook, (after)."CHECKPOINT_FIRST" AS checkpoint_first, (after)."BONUS" AS bonus, (after)."BOOST" AS boost, (after)."PLASMAF" AS plasmaf, (after)."PLASMAE" AS plasmae, (after)."PLASMAU" AS plasmau FROM record_mapinfo;
+CREATE INDEX mapinfo_map IN CLUSTER disk_cluster2 ON mapinfo (map);
 
 -- TODO: Why is table reference l ambiguous?
 -- materialize=> CREATE OR REPLACE MATERIALIZED VIEW ranks
@@ -132,7 +144,7 @@ CREATE OR REPLACE MATERIALIZED VIEW ranks_server
   JOIN race
   ON race.map = l.map AND race.time = l.minTime and race.name = l.name
   WHERE row_num <= 20;
-DROP INDEX ranks_server_map;
+DROP INDEX IF EXISTS ranks_server_map;
 CREATE INDEX ranks_server_map IN CLUSTER disk_cluster2 ON ranks_server (map, server, minTime);
 -- Use with: select * from ranks_server where map = 'Multeasymap' and server = 'GER' order by minTime;
 
@@ -146,7 +158,7 @@ CREATE OR REPLACE MATERIALIZED VIEW team_ranks_server
     JOIN race ON teamrace.map = race.map and teamrace.name = race.name and teamrace.time = race.time
     GROUP BY race.server, teamrace.map, id) l
   ON l.id = teamrace.id and l.map = teamrace.map AND l.row_num <= 20;
-DROP INDEX team_ranks_server_map;
+DROP INDEX IF EXISTS team_ranks_server_map;
 CREATE INDEX team_ranks_server_map IN CLUSTER disk_cluster2 ON team_ranks_server (map, server, time);
 -- Use with select * from team_ranks_server where server = 'GER' and map = 'Multeasymap' order by time;
 
@@ -154,13 +166,13 @@ CREATE OR REPLACE MATERIALIZED VIEW largest_team_server
   IN CLUSTER disk_cluster2
   AS (SELECT server, map, count FROM (
         SELECT server, teamrace.map, count(teamrace.name),
-          ROW_NUMBER() OVER (PARTITION BY map ORDER BY count(teamrace.name) DESC) AS row_num
+          ROW_NUMBER() OVER (PARTITION BY server, map ORDER BY count(teamrace.name) DESC) AS row_num
         FROM teamrace
         JOIN race ON teamrace.map = race.map and teamrace.name = race.name and teamrace.time = race.time
         GROUP BY server, teamrace.map, id
         ORDER BY count(teamrace.name))
       WHERE row_num = 1);
-DROP INDEX largest_team_map_server;
+DROP INDEX IF EXISTS largest_team_map_server;
 CREATE INDEX largest_team_map_server IN CLUSTER disk_cluster2 ON largest_team_server (map, server);
 -- Use: select * from largest_team_server where server = 'GER' and map = 'Multeasymap';
 
@@ -172,13 +184,15 @@ CREATE OR REPLACE MATERIALIZED VIEW most_finishes_server
     FROM race
     GROUP BY server, map, name
   ) WHERE row_num <= 20;
-DROP INDEX most_finishes_server_map;
+DROP INDEX IF EXISTS most_finishes_server_map;
 CREATE INDEX most_finishes_server_map IN CLUSTER disk_cluster2 ON most_finishes_server (map, server, count);
+-- Use: select * from most_finishes_server where server = 'GER' and map = 'Multeasymap';
 
 CREATE OR REPLACE MATERIALIZED VIEW stats_server
   IN CLUSTER disk_cluster2
   AS SELECT server, map, avg(time), min(timestamp), max(timestamp), count(*), count(distinct Name) as count_distinct
     FROM race
     GROUP BY server, map;
-DROP INDEX stats_server_map;
+DROP INDEX IF EXISTS stats_server_map;
 CREATE INDEX stats_server_map IN CLUSTER disk_cluster2 ON stats_server (map, server);
+-- Use with select * from stats_server where server = 'GER' and map = 'Multeasymap';
