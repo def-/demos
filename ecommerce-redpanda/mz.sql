@@ -1,3 +1,9 @@
+ALTER SYSTEM SET enable_disk_cluster_replicas = true
+
+CREATE CLUSTER disk_cluster1 REPLICAS (r1 (SIZE '1', DISK = true));
+
+CREATE CLUSTER disk_cluster2 REPLICAS (r1 (SIZE '1', DISK = true));
+
 DROP CONNECTION IF EXISTS redpanda_connection CASCADE;
 DROP CONNECTION IF EXISTS schema_registry CASCADE;
 
@@ -8,28 +14,30 @@ CREATE CONNECTION schema_registry
   TO CONFLUENT SCHEMA REGISTRY (URL 'http://127.0.0.1:8081');
 
 CREATE SOURCE record_race
+  IN CLUSTER disk_cluster1
   FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_race')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
-  ENVELOPE DEBEZIUM
-  WITH (SIZE = '1');
+  ENVELOPE DEBEZIUM;
 
 CREATE SOURCE record_teamrace
+  IN CLUSTER disk_cluster1
   FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_teamrace')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
-  ENVELOPE DEBEZIUM
-  WITH (SIZE = '1');
+  ENVELOPE DEBEZIUM;
 
 CREATE SOURCE record_maps
+  IN CLUSTER disk_cluster1
   FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_maps')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
-  ENVELOPE DEBEZIUM
-  WITH (SIZE = '1');
+  ENVELOPE DEBEZIUM;
 
 CREATE SOURCE record_mapinfo
+  IN CLUSTER disk_cluster1
   FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_mapinfo')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
-  ENVELOPE DEBEZIUM
-  WITH (SIZE = '1');
+  ENVELOPE DEBEZIUM;
+
+SET CLUSTER = disk_cluster2;
 
 CREATE DEFAULT INDEX ON record_race;
 CREATE DEFAULT INDEX ON record_teamrace;
