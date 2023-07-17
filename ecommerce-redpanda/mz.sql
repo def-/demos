@@ -1,8 +1,6 @@
-ALTER SYSTEM SET enable_disk_cluster_replicas = true
-
+ALTER SYSTEM SET enable_disk_cluster_replicas = true;
 CREATE CLUSTER disk_cluster1 REPLICAS (r1 (SIZE '1', DISK = true));
-
-CREATE CLUSTER disk_cluster2 REPLICAS (r1 (SIZE '1', DISK = true));
+CREATE CLUSTER disk_cluster2 REPLICAS (r1 (SIZE '16', DISK = true));
 
 DROP CONNECTION IF EXISTS redpanda_connection CASCADE;
 DROP CONNECTION IF EXISTS schema_registry CASCADE;
@@ -17,76 +15,170 @@ CREATE SOURCE record_race
   IN CLUSTER disk_cluster1
   FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_race')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
-  ENVELOPE DEBEZIUM;
+  ENVELOPE NONE;
 
 CREATE SOURCE record_teamrace
   IN CLUSTER disk_cluster1
   FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_teamrace')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
-  ENVELOPE DEBEZIUM;
+  ENVELOPE NONE;
 
 CREATE SOURCE record_maps
   IN CLUSTER disk_cluster1
   FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_maps')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
-  ENVELOPE DEBEZIUM;
+  ENVELOPE NONE;
 
 CREATE SOURCE record_mapinfo
   IN CLUSTER disk_cluster1
   FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_mapinfo')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
-  ENVELOPE DEBEZIUM;
+  ENVELOPE NONE;
 
-SET CLUSTER = disk_cluster2;
+CREATE OR REPLACE VIEW race AS SELECT (after)."Map" AS map, (after)."Server" as server, (after)."Name" as name, cast((after)."Timestamp" as timestamp) as timestamp, (after)."Time" as time FROM record_race;
+CREATE OR REPLACE VIEW teamrace AS SELECT (after)."Map" AS map, (after)."Name" as name, cast((after)."Timestamp" as timestamp) as timestamp, (after)."Time" as time, (after)."ID" as id, (after)."GameID" as gameid FROM record_teamrace;
+CREATE OR REPLACE VIEW maps AS SELECT (after)."Map" AS map, (after)."Server" as server, (after)."Points" as points, (after)."Stars" as stars, (after)."Mapper" as mapper, cast((after)."Timestamp" as timestamp) as timestamp FROM record_maps;
+CREATE INDEX maps_map IN CLUSTER disk_cluster2 ON maps (map);
 
-CREATE DEFAULT INDEX ON record_race;
-CREATE DEFAULT INDEX ON record_teamrace;
-CREATE DEFAULT INDEX ON record_maps;
-CREATE DEFAULT INDEX ON record_mapinfo;
+--  record(Map: text,Width: integer?,Height: integer?,DEATH: integer?,THROUGH: integer?,JUMP: integer?,DFREEZE: integer?,EHOOK_START: integer?,HIT_END: integer?,SOLO_START: integer?,TELE_GUN: integer?,TELE_GRENADE: integer?,TELE_LASER: integer?,NPC_START: integer?,SUPER_START: integer?,JETPACK_START: integer?,WALLJUMP: integer?,NPH_START: integer?,WEAPON_SHOTGUN: integer?,WEAPON_GRENADE: integer?,POWERUP_NINJA: integer?,WEAPON_RIFLE: integer?,LASER_STOP: integer?,CRAZY_SHOTGUN: integer?,DRAGGER: integer?,DOOR: integer?,SWITCH_TIMED: integer?,SWITCH: integer?,STOP: integer?,THROUGH_ALL: integer?,TUNE: integer?,OLDLASER: integer?,TELEINEVIL: integer?,TELEIN: integer?,TELECHECK: integer?,TELEINWEAPON: integer?,TELEINHOOK: integer?,CHECKPOINT_FIRST: integer?,BONUS: integer?,BOOST: integer?,PLASMAF: integer?,PLASMAE: integer?,PLASMAU: integer?)
+--CREATE VIEW mapinfo AS SELECT (after)."Map" AS map, (after)."Width" as width, (after)."Height" as height, (after)."Death" as death, (after)."Through" as through, (after)."Jump" as jump FROM record_maps;
 
--- Fails to work for relevant queries, default index is fine:
---CREATE INDEX race_timestamp ON record_race ("Timestamp");
---CREATE INDEX race_timestamp_server ON record_race ("Timestamp", "Server");
+-- TODO: Why is table reference l ambiguous?
+-- materialize=> CREATE OR REPLACE MATERIALIZED VIEW ranks
+--   IN CLUSTER disk_cluster2
+--   AS SELECT l.map, l.minTime, race.timestamp, l.count, l.minTimestamp, SUBSTRING(race.server, 1, 3) FROM (
+--     SELECT map, name, min(time) as minTime, name, count(*), min(timestamp) as minTimestamp,
+--       ROW_NUMBER() OVER (PARTITION BY map ORDER BY min(time) ASC) as row_num
+--     FROM race
+--     GROUP BY map, name
+--   ) l
+--   JOIN race
+--   ON race.map = l.map AND race.time = l.minTime and race.name = l.name
+--   WHERE row_num <= 20;
+-- ERROR:  table reference "l" is ambiguous
+CREATE OR REPLACE MATERIALIZED VIEW ranks
+  IN CLUSTER disk_cluster2
+  AS SELECT l.map, l.player as name, l.minTime, race.timestamp, l.count, l.minTimestamp, SUBSTRING(race.server, 1, 3) AS server FROM (
+    SELECT map, name as player, min(time) as minTime, name, count(*), min(timestamp) as minTimestamp,
+      ROW_NUMBER() OVER (PARTITION BY map ORDER BY min(time) ASC) as row_num
+    FROM race
+    GROUP BY map, name
+  ) l
+  JOIN race
+  ON race.map = l.map AND race.time = l.minTime and race.name = l.name
+  WHERE row_num <= 20;
+-- TODO: Not using index anymore
+CREATE INDEX ranks_map IN CLUSTER disk_cluster2 ON ranks (map, minTime);
+-- Use with: select * from ranks where map = 'Multeasymap' order by minTime;
 
--- MariaDB: select Name, count(*), sum(Time), min(Timestamp), max(Timestamp) from record_race where Map = '%s' %s group by Name order by count(*) desc limit 20;
-CREATE OR REPLACE MATERIALIZED VIEW most_finishes AS
-  SELECT * FROM (
-    SELECT "Map", count(*), "Name", sum("Time"), min("Timestamp"), max("Timestamp"),
-      ROW_NUMBER() OVER (PARTITION BY "Map" ORDER BY count(*) DESC) AS row_num
-    FROM record_race
-    GROUP BY "Map", "Name"
+CREATE OR REPLACE MATERIALIZED VIEW most_finishes
+  IN CLUSTER disk_cluster2
+  AS SELECT map, name, count, sum, min, max FROM (
+    SELECT map, name, count(*), sum(time), min(timestamp), max(timestamp),
+      ROW_NUMBER() OVER (PARTITION BY map ORDER BY count(*) DESC) AS row_num
+    FROM race
+    GROUP BY map, name
   ) WHERE row_num <= 20;
-CREATE INDEX most_finishes_map ON most_finishes ("Map", count);
--- Use with: select * from most_finishes where "Map" = 'Multeasymap' order by count desc;
+CREATE INDEX most_finishes_map IN CLUSTER disk_cluster2 ON most_finishes (map, count);
 
--- MariaDB: select l.Name, minTime, l.Timestamp, playCount, minTimestamp, SUBSTRING(l.Server, 1, 3) from (select * from record_race where Map = '%s' %s) as l JOIN (select Name, min(Time) as minTime, count(*) as playCount, min(Timestamp) as minTimestamp from record_race where Map = '%s' %s group by Name order by minTime ASC limit 20) as r on l.Time = r.minTime and l.Name = r.Name GROUP BY Name ORDER BY minTime, l.Name;
-CREATE OR REPLACE MATERIALIZED VIEW ranks AS
-  SELECT * FROM (
-    SELECT "Map", min("Time") as minTime, "Name", count(*), min("Timestamp") as minTimestamp,
-      ROW_NUMBER() OVER (PARTITION BY "Map" ORDER BY min("Time") ASC) as row_num
-    FROM record_race
-    GROUP BY "Map", "Name"
+-- MariaDB: select distinct r.Name, r.ID, r.Time, r.Timestamp, (select substring(Server, 1, 3) from record_race where Map = r.Map and Name = r.Name and Time = r.Time limit 1) as Server from ((select distinct ID from record_teamrace where Map = '%s' ORDER BY Time limit 20) as l) left join record_teamrace as r on l.ID = r.ID order by r.Time, r.ID, r.Name;
+CREATE OR REPLACE MATERIALIZED VIEW team_ranks
+  IN CLUSTER disk_cluster2
+  AS SELECT teamrace.map, name, teamrace.id, time, timestamp, (SELECT server FROM race WHERE map = teamrace.map and name = teamrace.name and time = teamrace.time limit 1) server
+  FROM (
+    teamrace
+    JOIN
+    (SELECT DISTINCT id, map, ROW_NUMBER() OVER (PARTITION BY map ORDER BY min(time)) as row_num
+      FROM teamrace
+      GROUP BY map, id) l
+    ON l.id = teamrace.id and l.map = teamrace.map AND l.row_num <= 20);
+-- TODO: Why is this index not used?
+CREATE INDEX team_ranks_map IN CLUSTER disk_cluster2 ON team_ranks (map, time);
+-- Use with select * from team_ranks where map = 'Multeasymap' order by time;
+
+-- MariaDB: select (select median(Time) over (partition by Map) from record_race where Map = '%s' %s limit 1), min(Timestamp), max(Timestamp), count(*), count(distinct Name) from record_race where Map = '%s' %s
+-- Doesn't support median yet: percentile_cont WITHIN GROUP in postgres, probably won't be, requires recalculation see https://materialize.com/blog/postgres-compatibility/
+CREATE OR REPLACE MATERIALIZED VIEW stats
+  IN CLUSTER disk_cluster2
+  AS SELECT map, avg(time), min(timestamp), max(timestamp), count(*), count(distinct Name) as count_distinct
+    FROM race
+    GROUP BY map;
+-- TODO: Why is this index not used?
+CREATE INDEX stats_map IN CLUSTER disk_cluster2 ON stats (map);
+-- Use: select * from stats where map = 'Multeasymap';
+
+-- MariaDB: select count(Name) from record_teamrace where Map = '%s' group by ID order by count(Name) desc limit 1;
+CREATE OR REPLACE MATERIALIZED VIEW largest_team
+  IN CLUSTER disk_cluster2
+  AS (SELECT map, count FROM (
+        SELECT map, count(name),
+          ROW_NUMBER() OVER (PARTITION BY map ORDER BY count(name) DESC) AS row_num
+        FROM teamrace
+        GROUP BY map, id
+        ORDER BY count(name))
+      WHERE row_num = 1);
+CREATE INDEX largest_team_map IN CLUSTER disk_cluster2 ON largest_team (map);
+-- Use: select * from largest_team where map = 'Multeasymap';
+
+-- Now for country-specific queries:
+CREATE OR REPLACE MATERIALIZED VIEW ranks_server
+  IN CLUSTER disk_cluster2
+  AS SELECT l.map, l.player as name, l.minTime, race.timestamp, l.count, l.minTimestamp, l.server FROM (
+    SELECT server, map, name as player, min(time) as minTime, name, count(*), min(timestamp) as minTimestamp,
+      ROW_NUMBER() OVER (PARTITION BY server, map ORDER BY min(time) ASC) as row_num
+    FROM race
+    GROUP BY server, map, name
+  ) l
+  JOIN race
+  ON race.map = l.map AND race.time = l.minTime and race.name = l.name
+  WHERE row_num <= 20;
+DROP INDEX ranks_server_map;
+CREATE INDEX ranks_server_map IN CLUSTER disk_cluster2 ON ranks_server (map, server, minTime);
+-- Use with: select * from ranks_server where map = 'Multeasymap' and server = 'GER' order by minTime;
+
+CREATE OR REPLACE MATERIALIZED VIEW team_ranks_server
+  IN CLUSTER disk_cluster2
+  AS SELECT teamrace.map, teamrace.name, teamrace.id, time, timestamp, server
+  FROM teamrace
+  JOIN
+  (SELECT DISTINCT id, server, teamrace.map, ROW_NUMBER() OVER (PARTITION BY race.server, teamrace.map ORDER BY min(teamrace.time)) as row_num
+    FROM teamrace
+    JOIN race ON teamrace.map = race.map and teamrace.name = race.name and teamrace.time = race.time
+    GROUP BY race.server, teamrace.map, id) l
+  ON l.id = teamrace.id and l.map = teamrace.map AND l.row_num <= 20;
+DROP INDEX team_ranks_server_map;
+CREATE INDEX team_ranks_server_map IN CLUSTER disk_cluster2 ON team_ranks_server (map, server, time);
+-- Use with select * from team_ranks_server where server = 'GER' and map = 'Multeasymap' order by time;
+
+CREATE OR REPLACE MATERIALIZED VIEW largest_team_server
+  IN CLUSTER disk_cluster2
+  AS (SELECT server, map, count FROM (
+        SELECT server, teamrace.map, count(teamrace.name),
+          ROW_NUMBER() OVER (PARTITION BY map ORDER BY count(teamrace.name) DESC) AS row_num
+        FROM teamrace
+        JOIN race ON teamrace.map = race.map and teamrace.name = race.name and teamrace.time = race.time
+        GROUP BY server, teamrace.map, id
+        ORDER BY count(teamrace.name))
+      WHERE row_num = 1);
+DROP INDEX largest_team_map_server;
+CREATE INDEX largest_team_map_server IN CLUSTER disk_cluster2 ON largest_team_server (map, server);
+-- Use: select * from largest_team_server where server = 'GER' and map = 'Multeasymap';
+
+CREATE OR REPLACE MATERIALIZED VIEW most_finishes_server
+  IN CLUSTER disk_cluster2
+  AS SELECT server, map, name, count, sum, min, max FROM (
+    SELECT server, map, name, count(*), sum(time), min(timestamp), max(timestamp),
+      ROW_NUMBER() OVER (PARTITION BY map ORDER BY count(*) DESC) AS row_num
+    FROM race
+    GROUP BY server, map, name
   ) WHERE row_num <= 20;
-CREATE INDEX ranks_map ON ranks ("Map", minTime);
--- Use with: select * from ranks where "Map" = 'Multeasymap' order by minTime;
+DROP INDEX most_finishes_server_map;
+CREATE INDEX most_finishes_server_map IN CLUSTER disk_cluster2 ON most_finishes_server (map, server, count);
 
--- Try normalizing instead:
-CREATE OR REPLACE MATERIALIZED VIEW maps AS SELECT row_number() OVER (ORDER BY "Timestamp", "Map") as id, "Map" as map FROM record_maps;
-CREATE DEFAULT INDEX ON maps;
--- Use with: select map from maps where id = 2204;
-
-CREATE OR REPLACE MATERIALIZED VIEW players AS SELECT row_number() OVER (ORDER BY min("Timestamp"), "Name") as id, "Name" as name FROM record_race GROUP BY name;
-CREATE DEFAULT INDEX ON players;
--- Use with: select name from players where id = 2204;
-
-CREATE OR REPLACE MATERIALIZED VIEW ranks AS
-  SELECT * FROM (
-    SELECT maps.id as map_id, min("Time") as min_time, players.id as player_id, count(*), min("Timestamp") as min_timestamp,
-      ROW_NUMBER() OVER (PARTITION BY maps.id ORDER BY min("Time") ASC) as row_num
-    FROM record_race
-    JOIN maps ON maps.map = record_race."Map"
-    JOIN players ON players.name = record_race."Name"
-    GROUP BY maps.id, players.id
-  ) WHERE row_num <= 20;
-CREATE INDEX ranks_map ON ranks (map_id, min_time);
--- Use with: select map, row_num, name, min_time, count, min_timestamp from ranks JOIN maps ON ranks.map_id = maps.id JOIN players ON ranks.player_id = players.id where map = 'Multeasymap' order by row_num;
+CREATE OR REPLACE MATERIALIZED VIEW stats_server
+  IN CLUSTER disk_cluster2
+  AS SELECT server, map, avg(time), min(timestamp), max(timestamp), count(*), count(distinct Name) as count_distinct
+    FROM race
+    GROUP BY server, map;
+DROP INDEX stats_server_map;
+CREATE INDEX stats_server_map IN CLUSTER disk_cluster2 ON stats_server (map, server);
