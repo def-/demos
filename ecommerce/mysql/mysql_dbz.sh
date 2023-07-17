@@ -10,7 +10,7 @@ curl -s -X PUT -H  "Content-Type:application/json" http://debezium:8083/connecto
     "database.user": "debezium",
     "database.password": "'"${MYSQL_PASSWORD}"'",
     "database.server.name": "mysql",
-    "database.server.id": "223344",
+    "database.server.id": "2",
     "database.allowPublicKeyRetrieval": true,
     "database.history.kafka.bootstrap.servers":"'"${CONFLUENT_BROKER_HOST}"'",
     "database.history.consumer.security.protocol": "SASL_SSL",

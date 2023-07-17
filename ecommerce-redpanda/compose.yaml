@@ -1,16 +1,17 @@
 services:
-  mysql:
-    image: mysql/mysql-server:8.0.27
-    ports:
-      - 3306:3306
-    environment:
-      - MYSQL_ROOT_PASSWORD=${MYSQL_PASSWORD}
-      - MYSQL_USER=mysqluser
-      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
-    volumes:
-      - ../ecommerce/mysql/mysql.cnf:/etc/mysql/conf.d
-      - ../ecommerce/mysql/mysql_bootstrap.sql:/docker-entrypoint-initdb.d/mysql_bootstrap.sql
-    healthcheck: {test: mysql -p$$MYSQL_PASSWORD -e 'select 1', interval: 1s, start_period: 60s}
+  # Running locally
+  #mysql:
+  #  image: mysql/mysql-server:8.0.27
+  #  ports:
+  #    - 3306:3306
+  #  environment:
+  #    - MYSQL_ROOT_PASSWORD=${MYSQL_PASSWORD}
+  #    - MYSQL_USER=mysqluser
+  #    - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+  #  volumes:
+  #    - ../ecommerce/mysql/mysql.cnf:/etc/mysql/conf.d
+  #    - ../ecommerce/mysql/mysql_bootstrap.sql:/docker-entrypoint-initdb.d/mysql_bootstrap.sql
+  #  healthcheck: {test: mysql -p$$MYSQL_PASSWORD -e 'select 1', interval: 1s, start_period: 60s}
   redpanda:
     image: docker.vectorized.io/vectorized/redpanda:v21.11.2
     command:
@@ -50,7 +51,7 @@ services:
     healthcheck: {test: curl -f localhost:8083, interval: 1s, start_period: 120s}
     depends_on:
       redpanda: {condition: service_healthy}
-      mysql: {condition: service_healthy}
+      #mysql: {condition: service_healthy}
   debezium_deploy:
     image: debezium/connect:1.9
     depends_on:
@@ -73,6 +74,6 @@ services:
       - KAFKA_ADDR=${EXTERNAL_IP:-redpanda}:9092
       - CONFLUENT_BROKER_HOST=${EXTERNAL_IP:-redpanda}:9092
     depends_on:
-      mysql: {condition: service_healthy}
+      #mysql: {condition: service_healthy}
       debezium: {condition: service_healthy}
       redpanda: {condition: service_healthy}
