@@ -138,7 +138,7 @@ CREATE OR REPLACE VIEW ranks_server
   JOIN race
   ON race.map = l.map AND race.time = l.minTime and race.name = l.name
   WHERE row_num <= 20;
-CREATE INDEX ranks_server_map IN CLUSTER disk_cluster2 ON ranks_server ("map", server, minTime);
+CREATE INDEX ranks_server_map IN CLUSTER disk_cluster2 ON ranks_server ("map", server);
 -- Use with: select * from ranks_server where "map" = 'Multeasymap' and server = 'GER' order by minTime;
 
 CREATE OR REPLACE VIEW team_ranks_server
@@ -172,7 +172,7 @@ CREATE OR REPLACE VIEW most_finishes_server
     FROM race
     GROUP BY server, "map", name
   ) WHERE row_num <= 20;
-CREATE INDEX most_finishes_server_map IN CLUSTER disk_cluster2 ON most_finishes_server ("map", server, count);
+CREATE INDEX most_finishes_server_map IN CLUSTER disk_cluster2 ON most_finishes_server ("map", server);
 -- Use: select * from most_finishes_server where server = 'GER' and "map" = 'Multeasymap';
 
 CREATE OR REPLACE VIEW stats_server
