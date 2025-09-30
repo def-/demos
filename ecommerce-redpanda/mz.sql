@@ -1,9 +1,9 @@
 DROP CLUSTER IF EXISTS source_cluster CASCADE;
 DROP CLUSTER IF EXISTS compute_cluster CASCADE;
 DROP CLUSTER IF EXISTS serving_cluster CASCADE;
-CREATE CLUSTER source_cluster REPLICAS (r1 (SIZE 'scale=1,workers=1'));
-CREATE CLUSTER compute_cluster REPLICAS (r1 (SIZE 'scale=1,workers=16'));
-CREATE CLUSTER serving_cluster REPLICAS (r1 (SIZE 'scale=1,workers=1'));
+CREATE CLUSTER source_cluster REPLICAS (r1 (SIZE '50cc'));
+CREATE CLUSTER compute_cluster REPLICAS (r1 (SIZE '800cc'));
+CREATE CLUSTER serving_cluster REPLICAS (r1 (SIZE '50cc'));
 
 DROP CONNECTION IF EXISTS redpanda_connection CASCADE;
 DROP CONNECTION IF EXISTS schema_registry CASCADE;
