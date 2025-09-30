@@ -1,10 +1,7 @@
--- As mz_system
---ALTER SYSTEM SET enable_disk_cluster_replicas = true;
-
-DROP CLUSTER IF EXISTS disk_cluster1 CASCADE;
-DROP CLUSTER IF EXISTS disk_cluster2 CASCADE;
-CREATE CLUSTER disk_cluster1 REPLICAS (r1 (SIZE 'scale=1,workers=1'));
-CREATE CLUSTER disk_cluster2 REPLICAS (r1 (SIZE 'scale=1,workers=16'));
+DROP CLUSTER IF EXISTS source_cluster CASCADE;
+DROP CLUSTER IF EXISTS compute_cluster CASCADE;
+CREATE CLUSTER source_cluster REPLICAS (r1 (SIZE 'scale=1,workers=1'));
+CREATE CLUSTER compute_cluster REPLICAS (r1 (SIZE 'scale=1,workers=16'));
 
 DROP CONNECTION IF EXISTS redpanda_connection CASCADE;
 DROP CONNECTION IF EXISTS schema_registry CASCADE;
@@ -16,48 +13,48 @@ CREATE CONNECTION schema_registry
   TO CONFLUENT SCHEMA REGISTRY (URL 'http://127.0.0.1:8081');
 
 CREATE SOURCE record_race
-  IN CLUSTER disk_cluster1
+  IN CLUSTER source_cluster
   FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_race')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
   ENVELOPE DEBEZIUM;
 
 CREATE SOURCE record_teamrace
-  IN CLUSTER disk_cluster1
+  IN CLUSTER source_cluster
   FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_teamrace')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
   ENVELOPE DEBEZIUM;
 
 CREATE SOURCE record_maps
-  IN CLUSTER disk_cluster1
+  IN CLUSTER source_cluster
   FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_maps')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
   ENVELOPE DEBEZIUM;
 
 CREATE SOURCE record_mapinfo
-  IN CLUSTER disk_cluster1
+  IN CLUSTER source_cluster
   FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_mapinfo')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
   ENVELOPE DEBEZIUM;
 
 CREATE SOURCE record_mappers
-  IN CLUSTER disk_cluster1
+  IN CLUSTER source_cluster
   FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_mappers')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
   ENVELOPE DEBEZIUM;
 
-SET cluster = disk_cluster2;
+SET cluster = compute_cluster;
 
 CREATE OR REPLACE VIEW race AS SELECT "Map" AS map, "Server" as server, "Name" as name, cast("Timestamp" as timestamp) as timestamp, "Time" as time FROM record_race;
-CREATE INDEX race_map_server_time IN CLUSTER disk_cluster2 ON race ("map", server);
+CREATE INDEX race_map_server_time IN CLUSTER compute_cluster ON race ("map", server);
 CREATE OR REPLACE VIEW teamrace AS SELECT "Map" AS map, "Name" as name, cast("Timestamp" as timestamp) as timestamp, "Time" as time, "ID" as id, "GameID" as gameid FROM record_teamrace;
-CREATE INDEX teamrace_map_time IN CLUSTER disk_cluster2 ON teamrace ("map");
+CREATE INDEX teamrace_map_time IN CLUSTER compute_cluster ON teamrace ("map");
 CREATE OR REPLACE VIEW maps AS SELECT "Map" AS map, "Server" as server, "Points" as points, "Stars" as stars, "Mapper" as mapper, cast("Timestamp" as timestamp) as timestamp FROM record_maps;
-CREATE INDEX maps_map IN CLUSTER disk_cluster2 ON maps ("map");
+CREATE INDEX maps_map IN CLUSTER compute_cluster ON maps ("map");
 
 CREATE OR REPLACE VIEW mappers AS SELECT "Mapper" AS Mapper, "NumMaps" as nummaps FROM record_mappers;
-CREATE INDEX mappers_mapper IN CLUSTER disk_cluster2 ON mappers (mapper);
+CREATE INDEX mappers_mapper IN CLUSTER compute_cluster ON mappers (mapper);
 CREATE VIEW mapinfo AS SELECT "Map" AS map, "Width" as width, "Height" as height, "DEATH" as death, "THROUGH" as through, "JUMP" as jump, "DFREEZE" AS dfreeze, "EHOOK_START" AS ehook_start, "HIT_END" AS hit_end, "SOLO_START" AS solo_start, "TELE_GUN" AS tele_gun, "TELE_GRENADE" AS tele_grenade, "TELE_LASER" AS tele_laser, "NPC_START" AS npc_start, "SUPER_START" AS super_start, "JETPACK_START" AS jetpack_start, "WALLJUMP" AS walljump, "NPH_START" AS nph_start, "WEAPON_SHOTGUN" AS weapon_shotgun, "WEAPON_GRENADE" AS weapon_grenade, "POWERUP_NINJA" AS powerup_ninja, "WEAPON_RIFLE" AS weapon_rifle, "LASER_STOP" AS laser_stop, "CRAZY_SHOTGUN" AS crazy_shotgun, "DRAGGER" AS dragger, "DOOR" AS door, "SWITCH_TIMED" AS switch_timed, "SWITCH" AS switch, "STOP" AS stop, "THROUGH_ALL" AS through_all, "TUNE" AS tune, "OLDLASER" AS oldlaser, "TELEINEVIL" AS teleinevil, "TELEIN" AS telein, "TELECHECK" AS telecheck, "TELEINWEAPON" AS teleinweapon, "TELEINHOOK" AS teleinhook, "CHECKPOINT_FIRST" AS checkpoint_first, "BONUS" AS bonus, "BOOST" AS boost, "PLASMAF" AS plasmaf, "PLASMAE" AS plasmae, "PLASMAU" AS plasmau FROM record_mapinfo;
-CREATE INDEX mapinfo_map IN CLUSTER disk_cluster2 ON mapinfo ("map");
+CREATE INDEX mapinfo_map IN CLUSTER compute_cluster ON mapinfo ("map");
 
 -- TODO: Why is table reference l ambiguous?
 -- materialize=> CREATE OR REPLACE VIEW ranks
@@ -81,7 +78,7 @@ CREATE OR REPLACE VIEW ranks
   JOIN race
   ON race.map = l.map AND race.time = l.minTime and race.name = l.name
   WHERE row_num <= 20;
-CREATE INDEX ranks_map IN CLUSTER disk_cluster2 ON ranks ("map");
+CREATE INDEX ranks_map IN CLUSTER compute_cluster ON ranks ("map");
 -- Use with: select * from ranks where "map" = 'Multeasymap' order by minTime;
 
 CREATE OR REPLACE VIEW most_finishes
@@ -91,7 +88,7 @@ CREATE OR REPLACE VIEW most_finishes
     FROM race
     GROUP BY "map", name
   ) WHERE row_num <= 20;
-CREATE INDEX most_finishes_map IN CLUSTER disk_cluster2 ON most_finishes ("map", count);
+CREATE INDEX most_finishes_map IN CLUSTER compute_cluster ON most_finishes ("map", count);
 
 -- MariaDB: select distinct r.Name, r.ID, r.Time, r.Timestamp, (select substring(Server, 1, 3) from record_race where Map = r.Map and Name = r.Name and Time = r.Time limit 1) as Server from ((select distinct ID from record_teamrace where Map = '%s' ORDER BY Time limit 20) as l) left join record_teamrace as r on l.ID = r.ID order by r.Time, r.ID, r.Name;
 CREATE OR REPLACE VIEW team_ranks
@@ -103,7 +100,7 @@ CREATE OR REPLACE VIEW team_ranks
       FROM teamrace
       GROUP BY "map", id) l
     ON l.id = teamrace.id and l.map = teamrace.map AND l.row_num <= 20);
-CREATE INDEX team_ranks_map IN CLUSTER disk_cluster2 ON team_ranks ("map");
+CREATE INDEX team_ranks_map IN CLUSTER compute_cluster ON team_ranks ("map");
 -- Use with select * from team_ranks where "map" = 'Multeasymap' order by time;
 
 -- MariaDB: select (select median(Time) over (partition by Map) from record_race where Map = '%s' %s limit 1), min(Timestamp), max(Timestamp), count(*), count(distinct Name) from record_race where Map = '%s' %s
@@ -112,7 +109,7 @@ CREATE OR REPLACE VIEW stats
   AS SELECT "map", avg(time), min(timestamp), max(timestamp), count(*), count(distinct Name) as count_distinct
     FROM race
     GROUP BY "map";
-CREATE INDEX stats_map IN CLUSTER disk_cluster2 ON stats ("map");
+CREATE INDEX stats_map IN CLUSTER compute_cluster ON stats ("map");
 -- Use: select * from stats where "map" = 'Multeasymap';
 
 -- MariaDB: select count(Name) from record_teamrace where Map = '%s' group by ID order by count(Name) desc limit 1;
@@ -124,7 +121,7 @@ CREATE OR REPLACE VIEW largest_team
         GROUP BY "map", id
         ORDER BY count(name))
       WHERE row_num = 1);
-CREATE INDEX largest_team_map IN CLUSTER disk_cluster2 ON largest_team ("map");
+CREATE INDEX largest_team_map IN CLUSTER compute_cluster ON largest_team ("map");
 -- Use: select * from largest_team where "map" = 'Multeasymap';
 
 -- Now for country-specific queries:
@@ -138,7 +135,7 @@ CREATE OR REPLACE VIEW ranks_server
   JOIN race
   ON race.map = l.map AND race.time = l.minTime and race.name = l.name
   WHERE row_num <= 20;
-CREATE INDEX ranks_server_map IN CLUSTER disk_cluster2 ON ranks_server ("map", server);
+CREATE INDEX ranks_server_map IN CLUSTER compute_cluster ON ranks_server ("map", server);
 -- Use with: select * from ranks_server where "map" = 'Multeasymap' and server = 'GER' order by minTime;
 
 CREATE OR REPLACE VIEW team_ranks_server
@@ -150,7 +147,7 @@ CREATE OR REPLACE VIEW team_ranks_server
     JOIN race ON teamrace.map = race.map and teamrace.name = race.name and teamrace.time = race.time
     GROUP BY race.server, teamrace.map, id) l
   ON l.id = teamrace.id and l.map = teamrace.map AND l.row_num <= 20;
-CREATE INDEX team_ranks_server_map IN CLUSTER disk_cluster2 ON team_ranks_server ("map", server);
+CREATE INDEX team_ranks_server_map IN CLUSTER compute_cluster ON team_ranks_server ("map", server);
 -- Use with select * from team_ranks_server where server = 'GER' and "map" = 'Multeasymap' order by time;
 
 CREATE OR REPLACE VIEW largest_team_server
@@ -162,7 +159,7 @@ CREATE OR REPLACE VIEW largest_team_server
         GROUP BY server, teamrace.map, id
         ORDER BY count(teamrace.name))
       WHERE row_num = 1);
-CREATE INDEX largest_team_map_server IN CLUSTER disk_cluster2 ON largest_team_server ("map", server);
+CREATE INDEX largest_team_map_server IN CLUSTER compute_cluster ON largest_team_server ("map", server);
 -- Use: select * from largest_team_server where server = 'GER' and "map" = 'Multeasymap';
 
 CREATE OR REPLACE VIEW most_finishes_server
@@ -172,12 +169,12 @@ CREATE OR REPLACE VIEW most_finishes_server
     FROM race
     GROUP BY server, "map", name
   ) WHERE row_num <= 20;
-CREATE INDEX most_finishes_server_map IN CLUSTER disk_cluster2 ON most_finishes_server ("map", server);
+CREATE INDEX most_finishes_server_map IN CLUSTER compute_cluster ON most_finishes_server ("map", server);
 -- Use: select * from most_finishes_server where server = 'GER' and "map" = 'Multeasymap';
 
 CREATE OR REPLACE VIEW stats_server
   AS SELECT server, "map", avg(time), min(timestamp), max(timestamp), count(*), count(distinct Name) as count_distinct
     FROM race
     GROUP BY server, "map";
-CREATE INDEX stats_server_map IN CLUSTER disk_cluster2 ON stats_server ("map", server);
+CREATE INDEX stats_server_map IN CLUSTER compute_cluster ON stats_server ("map", server);
 -- Use with select * from stats_server where server = 'GER' and "map" = 'Multeasymap';
