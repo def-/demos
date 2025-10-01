@@ -17,5 +17,6 @@ curl -s -X PUT -H  "Content-Type:application/json" http://debezium:8083/connecto
     "database.include.list": "teeworlds",
     "table.include.list": "teeworlds.record_race,teeworlds.record_teamrace,teeworlds.record_maps,teeworlds.record_mapinfo,teeworlds.record_mappers",
     "time.precision.mode": "connect",
-    "include.schema.changes": false
+    "include.schema.changes": false,
+    "snapshot.mode": "initial"
  }'
