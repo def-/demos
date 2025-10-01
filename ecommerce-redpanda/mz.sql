@@ -47,7 +47,9 @@ CREATE SOURCE record_mappers
 SET cluster = compute_cluster;
 
 CREATE OR REPLACE VIEW race AS SELECT "Map" AS map, "Server" as server, "Name" as name, cast("Timestamp" as timestamp) as timestamp, "Time" as time FROM record_race;
+CREATE INDEX race_idx IN CLUSTER compute_cluster ON race ("map", name, time);
 CREATE OR REPLACE VIEW teamrace AS SELECT "Map" AS map, "Name" as name, cast("Timestamp" as timestamp) as timestamp, "Time" as time, "ID" as id, "GameID" as gameid FROM record_teamrace;
+CREATE INDEX teamrace_idx IN CLUSTER compute_cluster ON teamrace (id, "map", time);
 CREATE OR REPLACE VIEW maps AS SELECT "Map" AS map, "Server" as server, "Points" as points, "Stars" as stars, "Mapper" as mapper, cast("Timestamp" as timestamp) as timestamp FROM record_maps;
 
 CREATE OR REPLACE VIEW mappers AS SELECT "Mapper" AS Mapper, "NumMaps" as nummaps FROM record_mappers;
@@ -163,6 +165,13 @@ IN CLUSTER compute_cluster
     OPTIONS (LIMIT INPUT GROUP SIZE 16777215);
 CREATE INDEX stats_map IN CLUSTER serving_cluster ON stats ("map");
 -- Use: select * from stats where "map" = 'Multeasymap';
+
+CREATE OR REPLACE MATERIALIZED VIEW team_stats
+IN CLUSTER compute_cluster
+  AS SELECT "map", count(*)
+    FROM teamrace
+    GROUP BY "map";
+CREATE INDEX team_stats_map IN CLUSTER serving_cluster ON team_stats ("map");
 
 -- MariaDB: select count(Name) from record_teamrace where Map = '%s' group by ID order by count(Name) desc limit 1;
 CREATE OR REPLACE MATERIALIZED VIEW largest_team
@@ -308,3 +317,27 @@ IN CLUSTER compute_cluster
 
 CREATE INDEX stats_server_map IN CLUSTER serving_cluster ON stats_server ("map", server);
 -- Use with select * from stats_server where server = 'GER' and "map" = 'Multeasymap';
+
+CREATE OR REPLACE MATERIALIZED VIEW last_finishes
+IN CLUSTER compute_cluster
+AS SELECT
+            l.timestamp,
+            l.map,
+            name,
+            time,
+            l.server
+        FROM
+            (
+                    (
+                                SELECT * FROM race
+                                OPTIONS (LIMIT INPUT GROUP SIZE 16777215)
+                                ORDER BY timestamp DESC
+                                LIMIT 500
+                            )
+                            AS l
+                        JOIN
+                            maps
+                            ON l.map = maps.map
+                )
+        ORDER BY timestamp DESC;
+CREATE DEFAULT INDEX last_finishes_idx IN CLUSTER serving_cluster ON last_finishes;
