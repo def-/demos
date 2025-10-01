@@ -213,38 +213,80 @@ CREATE INDEX ranks_server_map IN CLUSTER serving_cluster ON ranks_server ("map",
 
 CREATE OR REPLACE MATERIALIZED VIEW team_ranks_server
 IN CLUSTER compute_cluster
-  AS SELECT teamrace.map, teamrace.name, teamrace.id, time, timestamp, server
+AS SELECT sub."map", sub.name, sub.id, sub.time, sub.timestamp, sub.server
+FROM (
+  SELECT DISTINCT race.server, teamrace."map"
   FROM teamrace
-  JOIN
-  (SELECT DISTINCT id, server, teamrace.map, ROW_NUMBER() OVER (PARTITION BY race.server, teamrace.map ORDER BY min(teamrace.time)) as row_num
-    FROM teamrace
-    JOIN race ON teamrace.map = race.map and teamrace.name = race.name and teamrace.time = race.time
-    GROUP BY race.server, teamrace.map, id) l
-  ON l.id = teamrace.id and l.map = teamrace.map AND l.row_num <= 20;
+  JOIN race
+    ON teamrace."map" = race."map"
+   AND teamrace.name = race.name
+   AND teamrace.time = race.time
+) grp
+CROSS JOIN LATERAL (
+  SELECT teamrace.id, teamrace.name, teamrace.time, teamrace.timestamp, race.server, teamrace."map"
+  FROM teamrace
+  JOIN race
+    ON teamrace."map" = race."map"
+   AND teamrace.name = race.name
+   AND teamrace.time = race.time
+  WHERE race.server = grp.server
+    AND teamrace."map" = grp."map"
+  ORDER BY teamrace.time
+  LIMIT 20
+) sub
+ORDER BY sub.server, sub."map", sub.time;
 CREATE INDEX team_ranks_server_map IN CLUSTER serving_cluster ON team_ranks_server ("map", server);
 -- Use with select * from team_ranks_server where server = 'GER' and "map" = 'Multeasymap' order by time;
 
 CREATE OR REPLACE MATERIALIZED VIEW largest_team_server
 IN CLUSTER compute_cluster
-  AS (SELECT server, "map", count FROM (
-        SELECT server, teamrace.map, count(teamrace.name),
-          ROW_NUMBER() OVER (PARTITION BY server ORDER BY count(teamrace.name) DESC) AS row_num
-        FROM teamrace
-        JOIN race ON teamrace.map = race.map and teamrace.name = race.name and teamrace.time = race.time
-        GROUP BY server, teamrace.map, id
-        ORDER BY count(teamrace.name))
-      WHERE row_num = 1);
+AS SELECT grp.server, sub."map", sub.cnt
+FROM (
+  SELECT DISTINCT race.server
+  FROM teamrace
+  JOIN race
+    ON teamrace."map" = race."map"
+   AND teamrace.name = race.name
+   AND teamrace.time = race.time
+) grp
+CROSS JOIN LATERAL (
+  SELECT teamrace."map", COUNT(teamrace.name) AS cnt
+  FROM teamrace
+  JOIN race
+    ON teamrace."map" = race."map"
+   AND teamrace.name = race.name
+   AND teamrace.time = race.time
+  WHERE race.server = grp.server
+  GROUP BY teamrace."map"
+  ORDER BY COUNT(teamrace.name) DESC
+  LIMIT 1
+) sub
+ORDER BY grp.server;
 CREATE INDEX largest_team_map_server IN CLUSTER serving_cluster ON largest_team_server ("map", server);
 -- Use: select * from largest_team_server where server = 'GER' and "map" = 'Multeasymap';
 
 CREATE OR REPLACE MATERIALIZED VIEW most_finishes_server
 IN CLUSTER compute_cluster
-  AS SELECT server, "map", name, count, sum, min, max FROM (
-    SELECT server, "map", name, count(*), sum(time), min(timestamp), max(timestamp),
-      ROW_NUMBER() OVER (PARTITION BY "map" ORDER BY count(*) DESC) AS row_num
-    FROM race
-    GROUP BY server, "map", name
-  ) WHERE row_num <= 20;
+AS SELECT grp."map", sub.server, sub.name, sub.cnt, sub.total_time, sub.first_ts, sub.last_ts
+FROM (
+  SELECT DISTINCT "map"
+  FROM race
+) grp
+CROSS JOIN LATERAL (
+  SELECT server,
+         name,
+         COUNT(*)       AS cnt,
+         SUM(time)      AS total_time,
+         MIN(timestamp) AS first_ts,
+         MAX(timestamp) AS last_ts,
+         race."map"
+  FROM race
+  WHERE race."map" = grp."map"
+  GROUP BY server, race."map", name
+  ORDER BY COUNT(*) DESC
+  LIMIT 20
+) sub
+ORDER BY grp."map", sub.cnt DESC;
 CREATE INDEX most_finishes_server_map IN CLUSTER serving_cluster ON most_finishes_server ("map", server);
 -- Use: select * from most_finishes_server where server = 'GER' and "map" = 'Multeasymap';
 
