@@ -65,7 +65,7 @@ CREATE VIEW mapinfo AS SELECT "Map" AS map, "Width" as width, "Height" as height
 --   ON race.map = l.map AND race.time = l.minTime and race.name = l.name
 --   WHERE row_num <= 20;
 -- ERROR:  table reference "l" is ambiguous
-CREATE OR REPLACE MATERIALIZED VIEW ranks2
+CREATE OR REPLACE MATERIALIZED VIEW ranks
 IN CLUSTER compute_cluster
 AS SELECT grp.map,
        l.player AS name,
@@ -113,6 +113,7 @@ CROSS JOIN LATERAL (
     FROM race r
     WHERE r.map = grp.map
     GROUP BY name
+    OPTIONS (LIMIT INPUT GROUP SIZE 65535, AGGREGATE INPUT GROUP SIZE 255)
     ORDER BY COUNT(*) DESC
     LIMIT 20
 ) l
@@ -132,6 +133,7 @@ IN CLUSTER compute_cluster
          WHERE race."map" = teamrace."map"
            AND race.name = teamrace.name
            AND race.time = teamrace.time
+         OPTIONS (LIMIT INPUT GROUP SIZE 15)
          LIMIT 1) AS server
 FROM (SELECT DISTINCT "map" FROM teamrace) grp
 CROSS JOIN LATERAL (
@@ -140,6 +142,7 @@ CROSS JOIN LATERAL (
     FROM teamrace t
     WHERE t."map" = grp."map"
     GROUP BY id
+    OPTIONS (LIMIT INPUT GROUP SIZE 4095, AGGREGATE INPUT GROUP SIZE 15)
     ORDER BY MIN(time) ASC
     LIMIT 20
 ) l
@@ -156,7 +159,8 @@ CREATE OR REPLACE MATERIALIZED VIEW stats
 IN CLUSTER compute_cluster
   AS SELECT "map", avg(time), min(timestamp), max(timestamp), count(*), count(distinct Name) as count_distinct
     FROM race
-    GROUP BY "map";
+    GROUP BY "map"
+    OPTIONS (LIMIT INPUT GROUP SIZE 16777215);
 CREATE INDEX stats_map IN CLUSTER serving_cluster ON stats ("map");
 -- Use: select * from stats where "map" = 'Multeasymap';
 
@@ -172,6 +176,7 @@ CROSS JOIN LATERAL (
     FROM teamrace t
     WHERE t."map" = grp."map"
     GROUP BY id
+    OPTIONS (LIMIT INPUT GROUP SIZE 15)
     ORDER BY COUNT(name) DESC
     LIMIT 1
 ) l);
@@ -199,6 +204,7 @@ CROSS JOIN LATERAL (
     WHERE r.server = grp.server
       AND r."map" = grp."map"
     GROUP BY name, server
+    OPTIONS (LIMIT INPUT GROUP SIZE 4095, AGGREGATE INPUT GROUP SIZE 255)
     ORDER BY MIN(time) ASC
     LIMIT 20
 ) l
@@ -231,6 +237,7 @@ CROSS JOIN LATERAL (
    AND teamrace.time = race.time
   WHERE race.server = grp.server
     AND teamrace."map" = grp."map"
+  OPTIONS (LIMIT INPUT GROUP SIZE 4095)
   ORDER BY teamrace.time
   LIMIT 20
 ) sub
@@ -258,6 +265,7 @@ CROSS JOIN LATERAL (
    AND teamrace.time = race.time
   WHERE race.server = grp.server
   GROUP BY teamrace."map"
+  OPTIONS (LIMIT INPUT GROUP SIZE 65535)
   ORDER BY COUNT(teamrace.name) DESC
   LIMIT 1
 ) sub
@@ -283,6 +291,7 @@ CROSS JOIN LATERAL (
   FROM race
   WHERE race."map" = grp."map"
   GROUP BY server, race."map", name
+  OPTIONS (LIMIT INPUT GROUP SIZE 65535, AGGREGATE INPUT GROUP SIZE 255)
   ORDER BY COUNT(*) DESC
   LIMIT 20
 ) sub
@@ -294,6 +303,8 @@ CREATE OR REPLACE MATERIALIZED VIEW stats_server
 IN CLUSTER compute_cluster
   AS SELECT server, "map", avg(time), min(timestamp), max(timestamp), count(*), count(distinct Name) as count_distinct
     FROM race
-    GROUP BY server, "map";
+    GROUP BY server, "map"
+    OPTIONS (LIMIT INPUT GROUP SIZE 16777215);
+
 CREATE INDEX stats_server_map IN CLUSTER serving_cluster ON stats_server ("map", server);
 -- Use with select * from stats_server where server = 'GER' and "map" = 'Multeasymap';
