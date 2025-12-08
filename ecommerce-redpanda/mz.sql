@@ -256,7 +256,7 @@ CREATE INDEX team_ranks_server_map IN CLUSTER serving_cluster ON team_ranks_serv
 
 CREATE OR REPLACE MATERIALIZED VIEW largest_team_server
 IN CLUSTER compute_cluster
-AS SELECT grp.server, sub."map", sub.cnt
+AS SELECT grp.server, sub."map", sub.cnt as count
 FROM (
   SELECT DISTINCT race.server
   FROM teamrace
@@ -284,7 +284,7 @@ CREATE INDEX largest_team_map_server IN CLUSTER serving_cluster ON largest_team_
 
 CREATE OR REPLACE MATERIALIZED VIEW most_finishes_server
 IN CLUSTER compute_cluster
-AS SELECT grp."map", sub.server, sub.name, sub.cnt, sub.total_time, sub.first_ts, sub.last_ts
+AS SELECT grp."map", sub.server, sub.name, sub.cnt as count, sub.total_time as sum, sub.first_ts as min, sub.last_ts as max
 FROM (
   SELECT DISTINCT "map"
   FROM race
