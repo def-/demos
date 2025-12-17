@@ -1,3 +1,5 @@
+DROP CLUSTER IF EXISTS quickstart CASCADE;
+ALTER ROLE materialize SET cluster TO serving_cluster;
 DROP CLUSTER IF EXISTS source_cluster CASCADE;
 DROP CLUSTER IF EXISTS compute_cluster CASCADE;
 DROP CLUSTER IF EXISTS serving_cluster CASCADE;
@@ -55,18 +57,6 @@ CREATE OR REPLACE VIEW maps AS SELECT "Map" AS map, "Server" as server, "Points"
 CREATE OR REPLACE VIEW mappers AS SELECT "Mapper" AS Mapper, "NumMaps" as nummaps FROM record_mappers;
 CREATE VIEW mapinfo AS SELECT "Map" AS map, "Width" as width, "Height" as height, "DEATH" as death, "THROUGH" as through, "JUMP" as jump, "DFREEZE" AS dfreeze, "EHOOK_START" AS ehook_start, "HIT_END" AS hit_end, "SOLO_START" AS solo_start, "TELE_GUN" AS tele_gun, "TELE_GRENADE" AS tele_grenade, "TELE_LASER" AS tele_laser, "NPC_START" AS npc_start, "SUPER_START" AS super_start, "JETPACK_START" AS jetpack_start, "WALLJUMP" AS walljump, "NPH_START" AS nph_start, "WEAPON_SHOTGUN" AS weapon_shotgun, "WEAPON_GRENADE" AS weapon_grenade, "POWERUP_NINJA" AS powerup_ninja, "WEAPON_RIFLE" AS weapon_rifle, "LASER_STOP" AS laser_stop, "CRAZY_SHOTGUN" AS crazy_shotgun, "DRAGGER" AS dragger, "DOOR" AS door, "SWITCH_TIMED" AS switch_timed, "SWITCH" AS switch, "STOP" AS stop, "THROUGH_ALL" AS through_all, "TUNE" AS tune, "OLDLASER" AS oldlaser, "TELEINEVIL" AS teleinevil, "TELEIN" AS telein, "TELECHECK" AS telecheck, "TELEINWEAPON" AS teleinweapon, "TELEINHOOK" AS teleinhook, "CHECKPOINT_FIRST" AS checkpoint_first, "BONUS" AS bonus, "BOOST" AS boost, "PLASMAF" AS plasmaf, "PLASMAE" AS plasmae, "PLASMAU" AS plasmau FROM record_mapinfo;
 
--- TODO: Why is table reference l ambiguous?
--- materialize=> CREATE OR REPLACE VIEW ranks
---   AS SELECT l.map, l.minTime, race.timestamp, l.count, l.minTimestamp, SUBSTRING(race.server, 1, 3) FROM (
---     SELECT "map", name, min(time) as minTime, name, count(*), min(timestamp) as minTimestamp,
---       ROW_NUMBER() OVER (PARTITION BY "map" ORDER BY min(time) ASC) as row_num
---     FROM race
---     GROUP BY "map", name
---   ) l
---   JOIN race
---   ON race.map = l.map AND race.time = l.minTime and race.name = l.name
---   WHERE row_num <= 20;
--- ERROR:  table reference "l" is ambiguous
 CREATE OR REPLACE MATERIALIZED VIEW ranks
 IN CLUSTER compute_cluster
 AS SELECT grp.map,
@@ -168,7 +158,7 @@ CREATE INDEX stats_map IN CLUSTER serving_cluster ON stats ("map");
 
 CREATE OR REPLACE MATERIALIZED VIEW team_stats
 IN CLUSTER compute_cluster
-  AS SELECT "map", count(*)
+  AS SELECT "map", count(distinct id)
     FROM teamrace
     GROUP BY "map";
 CREATE INDEX team_stats_map IN CLUSTER serving_cluster ON team_stats ("map");
@@ -312,40 +302,34 @@ CREATE INDEX largest_team_map_server IN CLUSTER serving_cluster ON largest_team_
 -- Use: select * from largest_team_server where server = 'GER' and "map" = 'Multeasymap';
 
 CREATE OR REPLACE MATERIALIZED VIEW most_finishes_server
-IN CLUSTER compute_cluster
-AS
-WITH stats AS (
+IN CLUSTER compute_cluster AS
+SELECT
+    grp."map",
+    grp.server,
+    sub.name,
+    sub.count AS count,
+    sub.total_time AS sum,
+    sub.first_ts AS min,
+    sub.last_ts AS max
+FROM (
+    SELECT DISTINCT r."map", r.server
+    FROM race r
+) AS grp
+CROSS JOIN LATERAL (
     SELECT
-        r."map",
-        r.server,
         r.name,
-        COUNT(*)       AS cnt,
-        SUM(r.time)    AS total_time,
+        COUNT(*) AS count,
+        SUM(r.time) AS total_time,
         MIN(r.timestamp) AS first_ts,
         MAX(r.timestamp) AS last_ts
     FROM race r
-    GROUP BY r."map", r.server, r.name
-),
-ranked AS (
-    SELECT
-        *,
-        ROW_NUMBER() OVER (
-            PARTITION BY "map", server
-            ORDER BY cnt DESC
-        ) AS rn
-    FROM stats
-)
-SELECT
-    "map",
-    server,
-    name,
-    cnt AS count,
-    total_time AS sum,
-    first_ts AS min,
-    last_ts AS max
-FROM ranked
-WHERE rn <= 20
-ORDER BY "map", server, count DESC;
+    WHERE r."map" = grp."map"
+      AND r.server = grp.server
+    GROUP BY r.name
+    ORDER BY count DESC
+    LIMIT 20
+) AS sub
+ORDER BY grp."map", grp.server, sub.count DESC;
 CREATE INDEX most_finishes_server_map IN CLUSTER serving_cluster ON most_finishes_server ("map", server);
 -- Use: select * from most_finishes_server where server = 'GER' and "map" = 'Multeasymap';
 
@@ -366,14 +350,15 @@ AS SELECT
             l.map,
             name,
             time,
-            l.server
+            l.server,
+            maps.server as type
         FROM
             (
                     (
                                 SELECT * FROM race
                                 OPTIONS (LIMIT INPUT GROUP SIZE 16777215)
                                 ORDER BY timestamp DESC
-                                LIMIT 500
+                                LIMIT 20000
                             )
                             AS l
                         JOIN
@@ -381,100 +366,4 @@ AS SELECT
                             ON l.map = maps.map
                 )
         ORDER BY timestamp DESC;
-CREATE DEFAULT INDEX last_finishes_idx IN CLUSTER serving_cluster ON last_finishes;
-
-CREATE OR REPLACE MATERIALIZED VIEW last_finishes_server
-IN CLUSTER compute_cluster
-AS
-WITH ranked AS (
-    SELECT
-        r.timestamp,
-        r.map,
-        r.name,
-        r.time,
-        r.server,
-        ROW_NUMBER() OVER (
-            PARTITION BY r.server
-            ORDER BY r.timestamp DESC
-        ) AS rn
-    FROM race AS r
-    JOIN maps ON r.map = maps.map
-    WHERE r.server IS NOT NULL
-)
-SELECT
-    timestamp,
-    "map",
-    name,
-    time,
-    server
-FROM ranked
-WHERE rn <= 500
-ORDER BY timestamp DESC;
-
-CREATE INDEX last_finishes_server_server
-IN CLUSTER serving_cluster ON last_finishes_server (server);
-
-CREATE OR REPLACE MATERIALIZED VIEW last_finishes_type
-IN CLUSTER compute_cluster
-AS
-WITH ranked AS (
-    SELECT
-        r.timestamp,
-        r.map,
-        r.name,
-        r.time,
-        r.server,
-        maps.server AS type,
-        ROW_NUMBER() OVER (
-            PARTITION BY maps.server
-            ORDER BY r.timestamp DESC
-        ) AS rn
-    FROM race AS r
-    JOIN maps ON r.map = maps.map
-)
-SELECT
-    timestamp,
-    "map",
-    name,
-    time,
-    server,
-    type
-FROM ranked
-WHERE rn <= 500
-ORDER BY timestamp DESC;
-
-CREATE INDEX last_finishes_type_type
-IN CLUSTER serving_cluster ON last_finishes_type (type);
-
-CREATE OR REPLACE MATERIALIZED VIEW last_finishes_server_type
-IN CLUSTER compute_cluster
-AS
-WITH ranked AS (
-    SELECT
-        r.timestamp,
-        r.map,
-        r.name,
-        r.time,
-        r.server,
-        maps.server AS type,
-        ROW_NUMBER() OVER (
-            PARTITION BY r.server, maps.server
-            ORDER BY r.timestamp DESC
-        ) AS rn
-    FROM race AS r
-    JOIN maps ON r.map = maps.map
-    WHERE r.server IS NOT NULL
-)
-SELECT
-    timestamp,
-    "map",
-    name,
-    time,
-    server,
-    type
-FROM ranked
-WHERE rn <= 500
-ORDER BY timestamp DESC;
-
-CREATE INDEX last_finishes_server_type_idx
-IN CLUSTER serving_cluster ON last_finishes_server_type (server, type);
+CREATE INDEX last_finishes_idx IN CLUSTER serving_cluster ON last_finishes (timestamp);
