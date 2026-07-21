@@ -57,33 +57,57 @@ CREATE OR REPLACE VIEW maps AS SELECT "Map" AS map, "Server" as server, "Points"
 CREATE OR REPLACE VIEW mappers AS SELECT "Mapper" AS Mapper, "NumMaps" as nummaps FROM record_mappers;
 CREATE VIEW mapinfo AS SELECT "Map" AS map, "Width" as width, "Height" as height, "DEATH" as death, "THROUGH" as through, "JUMP" as jump, "DFREEZE" AS dfreeze, "EHOOK_START" AS ehook_start, "HIT_END" AS hit_end, "SOLO_START" AS solo_start, "TELE_GUN" AS tele_gun, "TELE_GRENADE" AS tele_grenade, "TELE_LASER" AS tele_laser, "NPC_START" AS npc_start, "SUPER_START" AS super_start, "JETPACK_START" AS jetpack_start, "WALLJUMP" AS walljump, "NPH_START" AS nph_start, "WEAPON_SHOTGUN" AS weapon_shotgun, "WEAPON_GRENADE" AS weapon_grenade, "POWERUP_NINJA" AS powerup_ninja, "WEAPON_RIFLE" AS weapon_rifle, "LASER_STOP" AS laser_stop, "CRAZY_SHOTGUN" AS crazy_shotgun, "DRAGGER" AS dragger, "DOOR" AS door, "SWITCH_TIMED" AS switch_timed, "SWITCH" AS switch, "STOP" AS stop, "THROUGH_ALL" AS through_all, "TUNE" AS tune, "OLDLASER" AS oldlaser, "TELEINEVIL" AS teleinevil, "TELEIN" AS telein, "TELECHECK" AS telecheck, "TELEINWEAPON" AS teleinweapon, "TELEINHOOK" AS teleinhook, "CHECKPOINT_FIRST" AS checkpoint_first, "BONUS" AS bonus, "BOOST" AS boost, "PLASMAF" AS plasmaf, "PLASMAE" AS plasmae, "PLASMAU" AS plasmau FROM record_mapinfo;
 
+-- Shared per-(map,name) aggregate: ONE MIN/MAX/SUM/COUNT reduction over race,
+-- reused by the global ranks / most_finishes leaderboards (avoids each rebuilding
+-- its own hierarchical MIN/MAX tower over the full race collection).
+CREATE OR REPLACE VIEW agg_map_name AS
+SELECT map, name,
+       COUNT(*)       AS finishes,
+       MIN(time)      AS min_time,
+       SUM(time)      AS sum_time,
+       MIN(timestamp) AS min_ts,
+       MAX(timestamp) AS max_ts
+FROM race
+GROUP BY map, name
+OPTIONS (AGGREGATE INPUT GROUP SIZE 255);
+CREATE INDEX agg_map_name_idx IN CLUSTER compute_cluster ON agg_map_name (map);
+
+-- Shared per-(map,server,name) aggregate: reused by the per-server leaderboards.
+CREATE OR REPLACE VIEW agg_map_server_name AS
+SELECT map, server, name,
+       COUNT(*)       AS finishes,
+       MIN(time)      AS min_time,
+       SUM(time)      AS sum_time,
+       MIN(timestamp) AS min_ts,
+       MAX(timestamp) AS max_ts
+FROM race
+GROUP BY map, server, name
+OPTIONS (AGGREGATE INPUT GROUP SIZE 255);
+CREATE INDEX agg_map_server_name_idx IN CLUSTER compute_cluster ON agg_map_server_name (map, server);
+
 CREATE OR REPLACE MATERIALIZED VIEW ranks
 IN CLUSTER compute_cluster
 AS SELECT grp.map,
-       l.player AS name,
-       l.minTime,
+       l.name,
+       l.min_time AS minTime,
        race.timestamp,
-       l.count,
-       l.minTimestamp,
+       l.finishes AS count,
+       l.min_ts AS minTimestamp,
        SUBSTRING(race.server, 1, 3) AS server
-FROM (SELECT DISTINCT "map" FROM race) grp
+FROM (SELECT DISTINCT map FROM agg_map_name) grp
 CROSS JOIN LATERAL (
-    SELECT name AS player,
-           MIN(time) AS minTime,
-           COUNT(*) AS count,
-           MIN(timestamp) AS minTimestamp
-    FROM race r
-    WHERE r.map = grp.map
-    GROUP BY name
-    OPTIONS (LIMIT INPUT GROUP SIZE 65535, AGGREGATE INPUT GROUP SIZE 255)
-    ORDER BY MIN(time) ASC
+    SELECT name, min_time, finishes, min_ts
+    FROM agg_map_name a
+    WHERE a.map = grp.map
+    OPTIONS (LIMIT INPUT GROUP SIZE 65535)
+    ORDER BY min_time ASC
     LIMIT 20
 ) l
 JOIN race
   ON race.map = grp.map
- AND race.name = l.player
- AND race.time = l.minTime
-ORDER BY grp.map, l.minTime;
+ AND race.name = l.name
+ AND race.time = l.min_time
+ORDER BY grp.map, l.min_time;
 CREATE INDEX ranks_map IN CLUSTER serving_cluster ON ranks ("map");
 -- Use with: select * from ranks where "map" = 'Multeasymap' order by minTime;
 
@@ -91,25 +115,20 @@ CREATE OR REPLACE MATERIALIZED VIEW most_finishes
 IN CLUSTER compute_cluster
 AS SELECT grp.map,
        l.name,
-       l.count,
-       l.sum,
-       l.min,
-       l.max
-FROM (SELECT DISTINCT "map" FROM race) grp
+       l.finishes AS count,
+       l.sum_time AS sum,
+       l.min_ts AS min,
+       l.max_ts AS max
+FROM (SELECT DISTINCT map FROM agg_map_name) grp
 CROSS JOIN LATERAL (
-    SELECT name,
-           COUNT(*) AS count,
-           SUM(time) AS sum,
-           MIN(timestamp) AS min,
-           MAX(timestamp) AS max
-    FROM race r
-    WHERE r.map = grp.map
-    GROUP BY name
-    OPTIONS (LIMIT INPUT GROUP SIZE 65535, AGGREGATE INPUT GROUP SIZE 255)
-    ORDER BY COUNT(*) DESC
+    SELECT name, finishes, sum_time, min_ts, max_ts
+    FROM agg_map_name a
+    WHERE a.map = grp.map
+    OPTIONS (LIMIT INPUT GROUP SIZE 65535)
+    ORDER BY finishes DESC
     LIMIT 20
 ) l
-ORDER BY grp.map, l.count DESC;
+ORDER BY grp.map, l.finishes DESC;
 CREATE INDEX most_finishes_map IN CLUSTER serving_cluster ON most_finishes ("map", count);
 
 -- MariaDB: select distinct r.Name, r.ID, r.Time, r.Timestamp, (select substring(Server, 1, 3) from record_race where Map = r.Map and Name = r.Name and Time = r.Time limit 1) as Server from ((select distinct ID from record_teamrace where Map = '%s' ORDER BY Time limit 20) as l) left join record_teamrace as r on l.ID = r.ID order by r.Time, r.ID, r.Name;
@@ -149,10 +168,15 @@ CREATE INDEX team_ranks_map IN CLUSTER serving_cluster ON team_ranks ("map");
 -- Doesn't support median yet: percentile_cont WITHIN GROUP in postgres, probably won't be, requires recalculation see https://materialize.com/blog/postgres-compatibility/
 CREATE OR REPLACE MATERIALIZED VIEW stats
 IN CLUSTER compute_cluster
-  AS SELECT "map", avg(time), min(timestamp), max(timestamp), count(*), count(distinct Name) as count_distinct
-    FROM race
-    GROUP BY "map"
-    OPTIONS (LIMIT INPUT GROUP SIZE 16777215);
+  AS SELECT map,
+       SUM(sum_time)::float8 / SUM(finishes) AS avg,
+       MIN(min_ts) AS min,
+       MAX(max_ts) AS max,
+       SUM(finishes) AS count,
+       COUNT(*) AS count_distinct
+    FROM agg_map_name
+    GROUP BY map
+    OPTIONS (AGGREGATE INPUT GROUP SIZE 16777215);
 CREATE INDEX stats_map IN CLUSTER serving_cluster ON stats ("map");
 -- Use: select * from stats where "map" = 'Multeasymap';
 
@@ -194,34 +218,28 @@ CREATE INDEX largest_team_map IN CLUSTER serving_cluster ON largest_team ("map")
 -- Now for country-specific queries:
 CREATE OR REPLACE MATERIALIZED VIEW ranks_server
 IN CLUSTER compute_cluster
-AS SELECT grp."map",
-       l.player AS name,
-       l.minTime,
+AS SELECT grp.map,
+       l.name,
+       l.min_time AS minTime,
        race.timestamp,
-       l.count,
-       l.minTimestamp,
-       l.server
-FROM (SELECT DISTINCT server, "map" FROM race) grp
+       l.finishes AS count,
+       l.min_ts AS minTimestamp,
+       grp.server
+FROM (SELECT DISTINCT map, server FROM agg_map_server_name) grp
 CROSS JOIN LATERAL (
-    SELECT name AS player,
-           MIN(time)       AS minTime,
-           COUNT(*)        AS count,
-           MIN(timestamp)  AS minTimestamp,
-           server
-    FROM race r
-    WHERE r.server = grp.server
-      AND r."map" = grp."map"
-    GROUP BY name, server
-    OPTIONS (LIMIT INPUT GROUP SIZE 4095, AGGREGATE INPUT GROUP SIZE 255)
-    ORDER BY MIN(time) ASC
+    SELECT name, min_time, finishes, min_ts
+    FROM agg_map_server_name a
+    WHERE a.map = grp.map AND a.server = grp.server
+    OPTIONS (LIMIT INPUT GROUP SIZE 4095)
+    ORDER BY min_time ASC
     LIMIT 20
 ) l
 JOIN race
   ON race.server = grp.server
- AND race."map"   = grp."map"
- AND race.name    = l.player
- AND race.time    = l.minTime
-ORDER BY grp.server, grp."map", l.minTime;
+ AND race.map     = grp.map
+ AND race.name    = l.name
+ AND race.time    = l.min_time
+ORDER BY grp.server, grp.map, l.min_time;
 CREATE INDEX ranks_server_map IN CLUSTER serving_cluster ON ranks_server ("map", server);
 -- Use with: select * from ranks_server where "map" = 'Multeasymap' and server = 'GER' order by minTime;
 
@@ -303,42 +321,37 @@ CREATE INDEX largest_team_map_server IN CLUSTER serving_cluster ON largest_team_
 
 CREATE OR REPLACE MATERIALIZED VIEW most_finishes_server
 IN CLUSTER compute_cluster AS
-SELECT
-    grp."map",
-    grp.server,
-    sub.name,
-    sub.count AS count,
-    sub.total_time AS sum,
-    sub.first_ts AS min,
-    sub.last_ts AS max
-FROM (
-    SELECT DISTINCT r."map", r.server
-    FROM race r
-) AS grp
+SELECT grp.map,
+       grp.server,
+       l.name,
+       l.finishes AS count,
+       l.sum_time AS sum,
+       l.min_ts AS min,
+       l.max_ts AS max
+FROM (SELECT DISTINCT map, server FROM agg_map_server_name) grp
 CROSS JOIN LATERAL (
-    SELECT
-        r.name,
-        COUNT(*) AS count,
-        SUM(r.time) AS total_time,
-        MIN(r.timestamp) AS first_ts,
-        MAX(r.timestamp) AS last_ts
-    FROM race r
-    WHERE r."map" = grp."map"
-      AND r.server = grp.server
-    GROUP BY r.name
-    ORDER BY count DESC
+    SELECT name, finishes, sum_time, min_ts, max_ts
+    FROM agg_map_server_name a
+    WHERE a.map = grp.map AND a.server = grp.server
+    OPTIONS (LIMIT INPUT GROUP SIZE 4095)
+    ORDER BY finishes DESC
     LIMIT 20
-) AS sub
-ORDER BY grp."map", grp.server, sub.count DESC;
+) l
+ORDER BY grp.map, grp.server, l.finishes DESC;
 CREATE INDEX most_finishes_server_map IN CLUSTER serving_cluster ON most_finishes_server ("map", server);
 -- Use: select * from most_finishes_server where server = 'GER' and "map" = 'Multeasymap';
 
 CREATE OR REPLACE MATERIALIZED VIEW stats_server
 IN CLUSTER compute_cluster
-  AS SELECT server, "map", avg(time), min(timestamp), max(timestamp), count(*), count(distinct Name) as count_distinct
-    FROM race
-    GROUP BY server, "map"
-    OPTIONS (LIMIT INPUT GROUP SIZE 16777215);
+  AS SELECT server, map,
+       SUM(sum_time)::float8 / SUM(finishes) AS avg,
+       MIN(min_ts) AS min,
+       MAX(max_ts) AS max,
+       SUM(finishes) AS count,
+       COUNT(*) AS count_distinct
+    FROM agg_map_server_name
+    GROUP BY server, map
+    OPTIONS (AGGREGATE INPUT GROUP SIZE 16777215);
 
 CREATE INDEX stats_server_map IN CLUSTER serving_cluster ON stats_server ("map", server);
 -- Use with select * from stats_server where server = 'GER' and "map" = 'Multeasymap';
@@ -356,7 +369,7 @@ AS SELECT
             (
                     (
                                 SELECT * FROM race
-                                OPTIONS (LIMIT INPUT GROUP SIZE 16777215)
+                                OPTIONS (LIMIT INPUT GROUP SIZE 4095)
                                 ORDER BY timestamp DESC
                                 LIMIT 20000
                             )
