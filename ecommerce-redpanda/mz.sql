@@ -1,3 +1,7 @@
+-- Needs, once per environment, as mz_system (psql postgresql://mz_system@localhost:6877/materialize):
+--   ALTER SYSTEM SET enable_columnar_accumulable_diff = true;
+-- It shrinks the COUNT/SUM accumulators in agg_map_name/agg_map_server_name and is the
+-- upstream default since MaterializeInc/materialize#40364 (2026-10-30).
 DROP CLUSTER IF EXISTS quickstart CASCADE;
 ALTER ROLE materialize SET cluster TO serving_cluster;
 DROP CLUSTER IF EXISTS source_cluster CASCADE;
@@ -18,38 +22,52 @@ CREATE CONNECTION schema_registry
 
 CREATE SOURCE record_race
   IN CLUSTER source_cluster
-  FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_race')
+  FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet2.teeworlds.record_race')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
   ENVELOPE DEBEZIUM;
 
 CREATE SOURCE record_teamrace
   IN CLUSTER source_cluster
-  FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_teamrace')
+  FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet2.teeworlds.record_teamrace')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
   ENVELOPE DEBEZIUM;
 
 CREATE SOURCE record_maps
   IN CLUSTER source_cluster
-  FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_maps')
+  FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet2.teeworlds.record_maps')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
   ENVELOPE DEBEZIUM;
 
 CREATE SOURCE record_mapinfo
   IN CLUSTER source_cluster
-  FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_mapinfo')
+  FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet2.teeworlds.record_mapinfo')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
   ENVELOPE DEBEZIUM;
 
 CREATE SOURCE record_mappers
   IN CLUSTER source_cluster
-  FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet.teeworlds.record_mappers')
+  FROM KAFKA CONNECTION redpanda_connection (TOPIC 'ddnet2.teeworlds.record_mappers')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION schema_registry
   ENVELOPE DEBEZIUM;
 
 SET cluster = compute_cluster;
 
+-- The race/teamrace joins below compare times rounded to 6 significant digits
+-- instead of exactly. That started as a workaround for the Debezium snapshot
+-- rounding MySQL FLOAT (fixed in mysql/mysql_dbz.sh with Time+0.0), but it is
+-- still load bearing: a player's own finish time and their team time genuinely
+-- differ by a tick or two on long maps. Measured 2026-09-16, an exact join
+-- drops 22 team member rows across Double Dragin, Just Triple Fly, Generic
+-- World, New Generation, Binary, Offpanic, Time Shop and Time to Switch.
 CREATE OR REPLACE VIEW race AS SELECT "Map" AS map, "Server" as server, "Name" as name, cast("Timestamp" as timestamp) as timestamp, "Time" as time FROM record_race;
 CREATE INDEX race_idx IN CLUSTER compute_cluster ON race ("map", name, time);
+-- Shared (map, name, round6(time)) re-key of race for the four team joins below,
+-- one arrangement instead of a private copy in each of them.
+CREATE OR REPLACE VIEW race_round6 AS
+SELECT map, server, name,
+       (CASE WHEN time <= 0 THEN time::numeric ELSE round(time::numeric, (5 - floor(log10(time)))::int) END) AS time6
+FROM race;
+CREATE INDEX race_round6_idx IN CLUSTER compute_cluster ON race_round6 ("map", name, time6);
 CREATE OR REPLACE VIEW teamrace AS SELECT "Map" AS map, "Name" as name, cast("Timestamp" as timestamp) as timestamp, "Time" as time, "ID" as id, "GameID" as gameid FROM record_teamrace;
 CREATE INDEX teamrace_idx IN CLUSTER compute_cluster ON teamrace (id, "map", time);
 CREATE OR REPLACE VIEW maps AS SELECT "Map" AS map, "Server" as server, "Points" as points, "Stars" as stars, "Mapper" as mapper, cast("Timestamp" as timestamp) as timestamp FROM record_maps;
@@ -60,6 +78,8 @@ CREATE VIEW mapinfo AS SELECT "Map" AS map, "Width" as width, "Height" as height
 -- Shared per-(map,name) aggregate: ONE MIN/MAX/SUM/COUNT reduction over race,
 -- reused by the global ranks / most_finishes leaderboards (avoids each rebuilding
 -- its own hierarchical MIN/MAX tower over the full race collection).
+-- Hint 15 = no bucket stage: groups average 2.2 finishes, so a bucket stage only
+-- held a second copy of race.
 CREATE OR REPLACE VIEW agg_map_name AS
 SELECT map, name,
        COUNT(*)       AS finishes,
@@ -69,7 +89,7 @@ SELECT map, name,
        MAX(timestamp) AS max_ts
 FROM race
 GROUP BY map, name
-OPTIONS (AGGREGATE INPUT GROUP SIZE 255);
+OPTIONS (AGGREGATE INPUT GROUP SIZE 15);
 CREATE INDEX agg_map_name_idx IN CLUSTER compute_cluster ON agg_map_name (map);
 
 -- Shared per-(map,server,name) aggregate: reused by the per-server leaderboards.
@@ -82,7 +102,7 @@ SELECT map, server, name,
        MAX(timestamp) AS max_ts
 FROM race
 GROUP BY map, server, name
-OPTIONS (AGGREGATE INPUT GROUP SIZE 255);
+OPTIONS (AGGREGATE INPUT GROUP SIZE 15);
 CREATE INDEX agg_map_server_name_idx IN CLUSTER compute_cluster ON agg_map_server_name (map, server);
 
 CREATE OR REPLACE MATERIALIZED VIEW ranks
@@ -90,23 +110,31 @@ IN CLUSTER compute_cluster
 AS SELECT grp.map,
        l.name,
        l.min_time AS minTime,
-       race.timestamp,
+       r.timestamp,
        l.finishes AS count,
        l.min_ts AS minTimestamp,
-       SUBSTRING(race.server, 1, 3) AS server
+       SUBSTRING(r.server, 1, 3) AS server
 FROM (SELECT DISTINCT map FROM agg_map_name) grp
 CROSS JOIN LATERAL (
     SELECT name, min_time, finishes, min_ts
     FROM agg_map_name a
     WHERE a.map = grp.map
-    OPTIONS (LIMIT INPUT GROUP SIZE 65535)
+    OPTIONS (LIMIT INPUT GROUP SIZE 4095)
     ORDER BY min_time ASC
     LIMIT 20
 ) l
-JOIN race
-  ON race.map = grp.map
- AND race.name = l.name
- AND race.time = l.min_time
+CROSS JOIN LATERAL (
+    -- Exactly one race row per (map, name, min_time): a player can hold the same
+    -- best time on several finishes, and joining race directly duplicated them.
+    SELECT timestamp, server
+    FROM race
+    WHERE race.map = grp.map
+      AND race.name = l.name
+      AND race.time = l.min_time
+    OPTIONS (LIMIT INPUT GROUP SIZE 15)
+    ORDER BY timestamp ASC
+    LIMIT 1
+) r
 ORDER BY grp.map, l.min_time;
 CREATE INDEX ranks_map IN CLUSTER serving_cluster ON ranks ("map");
 -- Use with: select * from ranks where "map" = 'Multeasymap' order by minTime;
@@ -124,12 +152,12 @@ CROSS JOIN LATERAL (
     SELECT name, finishes, sum_time, min_ts, max_ts
     FROM agg_map_name a
     WHERE a.map = grp.map
-    OPTIONS (LIMIT INPUT GROUP SIZE 65535)
+    OPTIONS (LIMIT INPUT GROUP SIZE 4095)
     ORDER BY finishes DESC
     LIMIT 20
 ) l
 ORDER BY grp.map, l.finishes DESC;
-CREATE INDEX most_finishes_map IN CLUSTER serving_cluster ON most_finishes ("map", count);
+CREATE INDEX most_finishes_map IN CLUSTER serving_cluster ON most_finishes ("map");
 
 -- MariaDB: select distinct r.Name, r.ID, r.Time, r.Timestamp, (select substring(Server, 1, 3) from record_race where Map = r.Map and Name = r.Name and Time = r.Time limit 1) as Server from ((select distinct ID from record_teamrace where Map = '%s' ORDER BY Time limit 20) as l) left join record_teamrace as r on l.ID = r.ID order by r.Time, r.ID, r.Name;
 CREATE OR REPLACE MATERIALIZED VIEW team_ranks
@@ -140,10 +168,10 @@ IN CLUSTER compute_cluster
        teamrace.time,
        teamrace.timestamp,
        (SELECT server
-          FROM race
-         WHERE race."map" = teamrace."map"
-           AND race.name = teamrace.name
-           AND race.time = teamrace.time
+          FROM race_round6 r
+         WHERE r."map" = teamrace."map"
+           AND r.name = teamrace.name
+           AND r.time6 = (CASE WHEN teamrace.time <= 0 THEN teamrace.time::numeric ELSE round(teamrace.time::numeric, (5 - floor(log10(teamrace.time)))::int) END)
          OPTIONS (LIMIT INPUT GROUP SIZE 15)
          LIMIT 1) AS server
 FROM (SELECT DISTINCT "map" FROM teamrace) grp
@@ -164,22 +192,6 @@ JOIN teamrace
 CREATE INDEX team_ranks_map IN CLUSTER serving_cluster ON team_ranks ("map");
 -- Use with select * from team_ranks where "map" = 'Multeasymap' order by time;
 
--- MariaDB: select (select median(Time) over (partition by Map) from record_race where Map = '%s' %s limit 1), min(Timestamp), max(Timestamp), count(*), count(distinct Name) from record_race where Map = '%s' %s
--- Doesn't support median yet: percentile_cont WITHIN GROUP in postgres, probably won't be, requires recalculation see https://materialize.com/blog/postgres-compatibility/
-CREATE OR REPLACE MATERIALIZED VIEW stats
-IN CLUSTER compute_cluster
-  AS SELECT map,
-       SUM(sum_time)::float8 / SUM(finishes) AS avg,
-       MIN(min_ts) AS min,
-       MAX(max_ts) AS max,
-       SUM(finishes) AS count,
-       COUNT(*) AS count_distinct
-    FROM agg_map_name
-    GROUP BY map
-    OPTIONS (AGGREGATE INPUT GROUP SIZE 16777215);
-CREATE INDEX stats_map IN CLUSTER serving_cluster ON stats ("map");
--- Use: select * from stats where "map" = 'Multeasymap';
-
 CREATE OR REPLACE MATERIALIZED VIEW team_stats
 IN CLUSTER compute_cluster
   AS SELECT "map", count(distinct id)
@@ -191,8 +203,8 @@ CREATE OR REPLACE MATERIALIZED VIEW team_stats_server
 IN CLUSTER compute_cluster
   AS SELECT teamrace."map", server, count(distinct id)
     FROM teamrace
-    LEFT JOIN race
-    ON teamrace."map" = race."map" and teamrace.name = race.name and teamrace.time = race.time
+    LEFT JOIN race_round6 r
+    ON teamrace."map" = r."map" and teamrace.name = r.name and r.time6 = (CASE WHEN teamrace.time <= 0 THEN teamrace.time::numeric ELSE round(teamrace.time::numeric, (5 - floor(log10(teamrace.time)))::int) END)
     GROUP BY teamrace."map", server;
 CREATE INDEX team_stats_server_map_server IN CLUSTER serving_cluster ON team_stats_server ("map", server);
 
@@ -221,7 +233,7 @@ IN CLUSTER compute_cluster
 AS SELECT grp.map,
        l.name,
        l.min_time AS minTime,
-       race.timestamp,
+       r.timestamp,
        l.finishes AS count,
        l.min_ts AS minTimestamp,
        grp.server
@@ -230,15 +242,25 @@ CROSS JOIN LATERAL (
     SELECT name, min_time, finishes, min_ts
     FROM agg_map_server_name a
     WHERE a.map = grp.map AND a.server = grp.server
-    OPTIONS (LIMIT INPUT GROUP SIZE 4095)
+    OPTIONS (LIMIT INPUT GROUP SIZE 255)
     ORDER BY min_time ASC
     LIMIT 20
 ) l
-JOIN race
-  ON race.server = grp.server
- AND race.map     = grp.map
- AND race.name    = l.name
- AND race.time    = l.min_time
+CROSS JOIN LATERAL (
+    -- Exactly one race row per (map, server, name, min_time): a player can hold the
+    -- same best time on several finishes, and joining race directly duplicated them.
+    SELECT timestamp
+    FROM race
+    WHERE race.map = grp.map
+      AND race.name = l.name
+      AND race.time = l.min_time
+      -- server as a range post-filter keeps the join key at (map, name, time),
+      -- so this lookup shares race_idx instead of arranging race again
+      AND race.server >= grp.server AND race.server <= grp.server
+    OPTIONS (LIMIT INPUT GROUP SIZE 15)
+    ORDER BY timestamp ASC
+    LIMIT 1
+) r
 ORDER BY grp.server, grp.map, l.min_time;
 CREATE INDEX ranks_server_map IN CLUSTER serving_cluster ON ranks_server ("map", server);
 -- Use with: select * from ranks_server where "map" = 'Multeasymap' and server = 'GER' order by minTime;
@@ -247,24 +269,23 @@ CREATE OR REPLACE MATERIALIZED VIEW team_ranks_server
 IN CLUSTER compute_cluster
 AS
 WITH ranked AS (
-    SELECT
-        teamrace.id,
-        teamrace.name,
-        teamrace.time,
-        teamrace.timestamp,
-        teamrace."map",
-        race.server,
-        DENSE_RANK() OVER (
-            PARTITION BY race.server, teamrace."map"
-            ORDER BY teamrace.time
-        ) AS team_rank
-    FROM teamrace
-    JOIN race
-      ON teamrace."map" = race."map"
-     AND teamrace.name = race.name
-     AND teamrace.time = race.time
+    -- The window packs its whole input, so the join is wrapped in a projection:
+    -- only the six columns the output needs reach the window state.
+    SELECT j.id, j.name, j.time, j.timestamp, j."map", j.server,
+           DENSE_RANK() OVER (PARTITION BY j.server, j."map" ORDER BY j.time) AS team_rank
+    FROM (
+        SELECT t.id, t.name, t.time, t.timestamp, t."map", r.server
+        FROM teamrace t
+        JOIN race_round6 r
+          ON t."map" = r."map"
+         AND t.name = r.name
+         AND r.time6 = (CASE WHEN t.time <= 0 THEN t.time::numeric ELSE round(t.time::numeric, (5 - floor(log10(t.time)))::int) END)
+    ) j
 )
-SELECT
+-- DISTINCT: a player can hold the same time on several race finishes, which
+-- duplicated them inside their team. Only race.server/race.timestamp vary across
+-- those rows and neither is selected raw, so the duplicates are exact.
+SELECT DISTINCT
     ranked."map",
     ranked.name,
     ranked.id,
@@ -281,15 +302,18 @@ CREATE OR REPLACE MATERIALIZED VIEW largest_team_server
 IN CLUSTER compute_cluster
 AS
 WITH joined AS (
-    SELECT
+    -- DISTINCT on name: a player holding the same time on several race finishes
+    -- was counted once per finish, inflating team sizes past the 64-player cap.
+    SELECT DISTINCT
         r.server,
         t."map",
-        t.id AS team_id
+        t.id AS team_id,
+        t.name
     FROM teamrace AS t
-    JOIN race AS r
+    JOIN race_round6 AS r
       ON t."map" = r."map"
      AND t.name  = r.name
-     AND t.time  = r.time
+     AND r.time6 = (CASE WHEN t.time <= 0 THEN t.time::numeric ELSE round(t.time::numeric, (5 - floor(log10(t.time)))::int) END)
 ),
 counts AS (
     -- size of each team (same id) within (server, map)
@@ -309,6 +333,7 @@ max_counts AS (
         MAX(cnt) AS max_cnt
     FROM counts
     GROUP BY server, "map"
+    OPTIONS (AGGREGATE INPUT GROUP SIZE 255)
 )
 SELECT
     server,
@@ -333,7 +358,7 @@ CROSS JOIN LATERAL (
     SELECT name, finishes, sum_time, min_ts, max_ts
     FROM agg_map_server_name a
     WHERE a.map = grp.map AND a.server = grp.server
-    OPTIONS (LIMIT INPUT GROUP SIZE 4095)
+    OPTIONS (LIMIT INPUT GROUP SIZE 255)
     ORDER BY finishes DESC
     LIMIT 20
 ) l
@@ -351,10 +376,31 @@ IN CLUSTER compute_cluster
        COUNT(*) AS count_distinct
     FROM agg_map_server_name
     GROUP BY server, map
-    OPTIONS (AGGREGATE INPUT GROUP SIZE 16777215);
+    OPTIONS (AGGREGATE INPUT GROUP SIZE 15);
 
 CREATE INDEX stats_server_map IN CLUSTER serving_cluster ON stats_server ("map", server);
 -- Use with select * from stats_server where server = 'GER' and "map" = 'Multeasymap';
+
+-- MariaDB: select (select median(Time) over (partition by Map) from record_race where Map = '%s' %s limit 1), min(Timestamp), max(Timestamp), count(*), count(distinct Name) from record_race where Map = '%s' %s
+-- Doesn't support median yet: percentile_cont WITHIN GROUP in postgres, probably won't be, requires recalculation see https://materialize.com/blog/postgres-compatibility/
+-- MIN/MAX per map come from stats_server (~44k rows) instead of a hierarchical
+-- reduce over 32M (map, name) rows, so stats must be created after stats_server.
+CREATE OR REPLACE MATERIALIZED VIEW stats
+IN CLUSTER compute_cluster
+  AS SELECT a.map, a.avg, m.min, m.max, a.count, a.count_distinct
+    FROM (SELECT map,
+                 SUM(sum_time)::float8 / SUM(finishes) AS avg,
+                 SUM(finishes) AS count,
+                 COUNT(*) AS count_distinct
+            FROM agg_map_name
+            GROUP BY map) a
+    JOIN (SELECT map, MIN(min) AS min, MAX(max) AS max
+            FROM stats_server
+            GROUP BY map
+            OPTIONS (AGGREGATE INPUT GROUP SIZE 255)) m
+      ON m.map = a.map;
+CREATE INDEX stats_map IN CLUSTER serving_cluster ON stats ("map");
+-- Use: select * from stats where "map" = 'Multeasymap';
 
 CREATE OR REPLACE MATERIALIZED VIEW last_finishes
 IN CLUSTER compute_cluster
@@ -368,8 +414,12 @@ AS SELECT
         FROM
             (
                     (
+                                -- The 7-day window keeps the TopK at ~200k rows instead of
+                                -- all of race, output is identical while at least 20000
+                                -- finishes fall in it (about 180k do).
                                 SELECT * FROM race
-                                OPTIONS (LIMIT INPUT GROUP SIZE 4095)
+                                WHERE mz_now() <= timestamp + INTERVAL '7 days'
+                                OPTIONS (LIMIT INPUT GROUP SIZE 15)
                                 ORDER BY timestamp DESC
                                 LIMIT 20000
                             )

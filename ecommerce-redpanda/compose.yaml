@@ -13,6 +13,7 @@ services:
   #    - ../ecommerce/mysql/mysql_bootstrap.sql:/docker-entrypoint-initdb.d/mysql_bootstrap.sql
   #  healthcheck: {test: mysql -p$$MYSQL_PASSWORD -e 'select 1', interval: 1s, start_period: 60s}
   redpanda:
+    restart: unless-stopped
     image: redpandadata/redpanda:v22.3.25
     command:
       - redpanda start
@@ -34,6 +35,7 @@ services:
       - 8082:8082
     healthcheck: {test: curl -f localhost:9644/v1/status/ready, interval: 1s, start_period: 30s}
   debezium:
+    restart: unless-stopped
     image: debezium/connect:1.9
     environment:
       BOOTSTRAP_SERVERS: ${EXTERNAL_IP:-redpanda}:9092
@@ -57,6 +59,7 @@ services:
     depends_on:
       debezium: {condition: service_healthy}
     environment:
+      - MYSQL_HOST=${MYSQL_HOST}
       - MYSQL_PASSWORD=${MYSQL_PASSWORD}
       - KAFKA_ADDR=${EXTERNAL_IP:-redpanda}:9092
     volumes:
